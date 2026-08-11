@@ -476,10 +476,16 @@
             return paginas.join('\n');
         }
 
+        function localizarMarcador(texto, marcador, aPartirDe = 0) {
+            const padrao = marcador.split(' ').join('\\s*');
+            const correspondencia = new RegExp(padrao).exec(texto.slice(aPartirDe));
+            return correspondencia ? aPartirDe + correspondencia.index : -1;
+        }
+
         function intervalo(texto, inicio, fim) {
-            const posicaoInicio = texto.indexOf(inicio);
+            const posicaoInicio = localizarMarcador(texto, inicio);
             if (posicaoInicio < 0) return '';
-            const posicaoFim = texto.indexOf(fim, posicaoInicio + inicio.length);
+            const posicaoFim = localizarMarcador(texto, fim, posicaoInicio + inicio.length);
             return texto.slice(posicaoInicio, posicaoFim < 0 ? undefined : posicaoFim);
         }
 
@@ -489,12 +495,17 @@
             // antes da continuação. Removê-los recompõe o nome sem criar aproximações ambíguas.
             const secaoSemColunas = secao.replace(/CURSOU EQUIVALENTE/g, ' ')
                 .replace(/\b(?:NAO|\d+)\b/g, ' ').replace(/\s+/g, ' ');
-            return secaoSemColunas.includes(nomeNormalizado);
+            if (secaoSemColunas.includes(nomeNormalizado)) return true;
+
+            // Fallback para PDFs que omitem espaços entre palavras por diferença de fonte/renderização.
+            const nomeCompacto = nomeNormalizado.replace(/\s/g, '');
+            const secaoCompacta = secaoSemColunas.replace(/\s/g, '');
+            return nomeCompacto.length >= 12 && secaoCompacta.includes(nomeCompacto);
         }
 
         function interpretarMatriz(textoOriginal) {
             const texto = normalizarTexto(textoOriginal);
-            if (!texto.includes('SISTEMA DE GESTAO ACADEMICA') || !texto.includes('DEFINICAO DE CURRICULO')) {
+            if (localizarMarcador(texto, 'SISTEMA DE GESTAO ACADEMICA') < 0 || localizarMarcador(texto, 'DEFINICAO DE CURRICULO') < 0) {
                 throw new Error('O arquivo não parece ser a matriz curricular exportada pelo SGA.');
             }
             const cursadas = intervalo(texto, 'DISCIPLINAS DO CURRICULO', 'DISCIPLINAS EQUIVALENTES');
@@ -502,9 +513,16 @@
             if (!cursadas || !emCurso) throw new Error('Não foi possível localizar as seções de disciplinas no PDF.');
 
             const resultado = {};
-            for (const nome of Object.keys(disciplinas)) {
-                if (secaoContemDisciplina(emCurso, nome)) resultado[nome] = 'cursando';
-                else if (secaoContemDisciplina(cursadas, nome)) resultado[nome] = 'concluida';
+            const codigosCursadas = new Set(cursadas.match(/\b\d{5}\b/g) || []);
+            const codigosEmCurso = new Set(emCurso.match(/\b\d{5}\b/g) || []);
+
+            for (const [nome, info] of Object.entries(disciplinas)) {
+                const codigos = [info.codigo, ...(info.codigosAlternativos || [])];
+                if (codigos.some(codigo => codigosEmCurso.has(codigo)) || secaoContemDisciplina(emCurso, nome)) {
+                    resultado[nome] = 'cursando';
+                } else if (codigos.some(codigo => codigosCursadas.has(codigo)) || secaoContemDisciplina(cursadas, nome)) {
+                    resultado[nome] = 'concluida';
+                }
             }
             return resultado;
         }
