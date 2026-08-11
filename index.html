@@ -124,6 +124,27 @@
             transform: translateY(-1px);
         }
 
+        .btn-importar {
+            background: #eff6ff;
+            color: #1d4ed8;
+            border: 1px solid #bfdbfe;
+            padding: 8px 18px;
+            border-radius: 9999px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.85rem;
+            font-family: inherit;
+            transition: all 0.2s ease;
+        }
+
+        .btn-importar:hover { background: #2563eb; color: #fff; border-color: #2563eb; transform: translateY(-1px); }
+        .btn-importar:disabled { opacity: 0.65; cursor: wait; transform: none; }
+        .btn-exportar { background: #f5f3ff; color: #6d28d9; border: 1px solid #ddd6fe; padding: 8px 18px; border-radius: 9999px; cursor: pointer; font-weight: 600; font-size: 0.85rem; font-family: inherit; transition: all 0.2s ease; }
+        .btn-exportar:hover { background: #7c3aed; color: #fff; border-color: #7c3aed; transform: translateY(-1px); }
+        .importacao-status { width: 100%; min-height: 1.1rem; color: var(--text-muted); font-size: 0.78rem; text-align: center; }
+        .importacao-status.erro { color: #dc2626; }
+        .importacao-status.sucesso { color: #047857; }
+
         .grade-container {
             flex: 1;
             display: flex;
@@ -386,8 +407,12 @@
             <div>Concluídas: <span class="highlight" id="contador">0</span>/<span id="total">0</span></div>
             <div>Cursando: <span class="highlight" style="color: #2563eb" id="cursando">0</span></div>
             <div>Carga Horária (Concluída): <span class="highlight" style="color: #4f46e5" id="horas">0</span>h</div>
+            <button class="btn-importar" id="btn-importar" type="button" onclick="selecionarMatriz()">Importar matriz do SGA</button>
+            <input id="arquivo-matriz" type="file" accept="application/pdf,.pdf" hidden onchange="importarMatriz(this.files[0])">
+            <button class="btn-exportar" type="button" onclick="exportarGradeComoPng()">Exportar PNG</button>
             <button class="limpar" onclick="limparGrade()">Limpar Grade</button>
         </div>
+        <div class="importacao-status" id="importacao-status" role="status" aria-live="polite"></div>
     </header>
 
     <div class="grade-container" id="grade-container">
@@ -397,9 +422,263 @@
     <script src="disciplinas.js"></script>
 
     <script>
-        // Agora armazenamos o estado como um objeto: { "Nome da Matéria": "concluida" | "cursando" }
-        let statusMaterias = JSON.parse(localStorage.getItem('pucEngSoftStatus')) || {};
-        let ordemMaterias = JSON.parse(localStorage.getItem('pucEngSoftOrdem')) || {};
+        const STORAGE_KEY = 'pucEngSoftGrade';
+
+        function carregarEstado() {
+            try {
+                const estado = JSON.parse(localStorage.getItem(STORAGE_KEY));
+                if (estado && estado.versao === 1) return estado;
+            } catch (erro) {
+                console.warn('Não foi possível restaurar o progresso salvo.', erro);
+            }
+            return {
+                versao: 1,
+                statusMaterias: JSON.parse(localStorage.getItem('pucEngSoftStatus')) || {},
+                ordemMaterias: JSON.parse(localStorage.getItem('pucEngSoftOrdem')) || {}
+            };
+        }
+
+        const estadoInicial = carregarEstado();
+        let statusMaterias = estadoInicial.statusMaterias || {};
+        let ordemMaterias = estadoInicial.ordemMaterias || {};
+
+        function persistirEstado() {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify({ versao: 1, statusMaterias, ordemMaterias, atualizadoEm: new Date().toISOString() }));
+            localStorage.setItem('pucEngSoftStatus', JSON.stringify(statusMaterias));
+            localStorage.setItem('pucEngSoftOrdem', JSON.stringify(ordemMaterias));
+        }
+
+        function informarImportacao(mensagem, tipo = '') {
+            const elemento = document.getElementById('importacao-status');
+            elemento.textContent = mensagem;
+            elemento.className = `importacao-status ${tipo}`;
+        }
+
+        function selecionarMatriz() {
+            document.getElementById('arquivo-matriz').click();
+        }
+
+        function normalizarTexto(texto) {
+            return texto.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\([^)]*\)/g, ' ')
+                .replace(/[^A-Z0-9]+/gi, ' ').replace(/\s+/g, ' ').trim().toUpperCase();
+        }
+
+        async function extrairTextoPdf(arquivo) {
+            const pdfjsLib = await import('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs');
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
+            const pdf = await pdfjsLib.getDocument({ data: await arquivo.arrayBuffer() }).promise;
+            const paginas = [];
+            for (let numero = 1; numero <= pdf.numPages; numero++) {
+                const pagina = await pdf.getPage(numero);
+                const conteudo = await pagina.getTextContent();
+                paginas.push(conteudo.items.map(item => item.str).join(' '));
+            }
+            return paginas.join('\n');
+        }
+
+        function intervalo(texto, inicio, fim) {
+            const posicaoInicio = texto.indexOf(inicio);
+            if (posicaoInicio < 0) return '';
+            const posicaoFim = texto.indexOf(fim, posicaoInicio + inicio.length);
+            return texto.slice(posicaoInicio, posicaoFim < 0 ? undefined : posicaoFim);
+        }
+
+        function secaoContemDisciplina(secao, nome) {
+            const nomeNormalizado = normalizarTexto(nome);
+            // Em nomes quebrados entre linhas, o SGA insere nota, CH, créditos e "Não"
+            // antes da continuação. Removê-los recompõe o nome sem criar aproximações ambíguas.
+            const secaoSemColunas = secao.replace(/CURSOU EQUIVALENTE/g, ' ')
+                .replace(/\b(?:NAO|\d+)\b/g, ' ').replace(/\s+/g, ' ');
+            return secaoSemColunas.includes(nomeNormalizado);
+        }
+
+        function interpretarMatriz(textoOriginal) {
+            const texto = normalizarTexto(textoOriginal);
+            if (!texto.includes('SISTEMA DE GESTAO ACADEMICA') || !texto.includes('DEFINICAO DE CURRICULO')) {
+                throw new Error('O arquivo não parece ser a matriz curricular exportada pelo SGA.');
+            }
+            const cursadas = intervalo(texto, 'DISCIPLINAS DO CURRICULO', 'DISCIPLINAS EQUIVALENTES');
+            const emCurso = intervalo(texto, 'DISCIPLINAS EM CURSO', 'DISCIPLINAS A CURSAR');
+            if (!cursadas || !emCurso) throw new Error('Não foi possível localizar as seções de disciplinas no PDF.');
+
+            const resultado = {};
+            for (const nome of Object.keys(disciplinas)) {
+                if (secaoContemDisciplina(emCurso, nome)) resultado[nome] = 'cursando';
+                else if (secaoContemDisciplina(cursadas, nome)) resultado[nome] = 'concluida';
+            }
+            return resultado;
+        }
+
+        async function importarMatriz(arquivo) {
+            const input = document.getElementById('arquivo-matriz');
+            const botao = document.getElementById('btn-importar');
+            if (!arquivo) return;
+            if (!arquivo.name.toLowerCase().endsWith('.pdf')) {
+                informarImportacao('Selecione um arquivo PDF.', 'erro');
+                input.value = '';
+                return;
+            }
+
+            botao.disabled = true;
+            informarImportacao('Lendo a matriz curricular...');
+            try {
+                const resultado = interpretarMatriz(await extrairTextoPdf(arquivo));
+                const total = Object.keys(resultado).length;
+                const concluidas = Object.values(resultado).filter(s => s === 'concluida').length;
+                const cursando = Object.values(resultado).filter(s => s === 'cursando').length;
+                if (!total) throw new Error('Nenhuma disciplina da grade foi reconhecida no PDF.');
+                if (!confirm(`Foram encontradas ${concluidas} disciplinas concluídas e ${cursando} em curso. Substituir o progresso atual?`)) {
+                    informarImportacao('Importação cancelada. Seu progresso não foi alterado.');
+                    return;
+                }
+                statusMaterias = resultado;
+                persistirEstado();
+                renderizarGrade();
+                informarImportacao(`Matriz importada: ${concluidas} concluídas e ${cursando} em curso.`, 'sucesso');
+            } catch (erro) {
+                console.error(erro);
+                informarImportacao(erro.message || 'Não foi possível importar o PDF.', 'erro');
+            } finally {
+                botao.disabled = false;
+                input.value = '';
+            }
+        }
+
+        function desenharRetanguloArredondado(ctx, x, y, largura, altura, raio) {
+            ctx.beginPath();
+            ctx.roundRect(x, y, largura, altura, raio);
+            ctx.fill();
+            if (ctx.lineWidth > 0) ctx.stroke();
+        }
+
+        function quebrarTexto(ctx, texto, larguraMaxima, maximoLinhas = 2) {
+            const palavras = texto.split(' ');
+            const linhas = [];
+            let linha = '';
+            for (const palavra of palavras) {
+                const teste = linha ? `${linha} ${palavra}` : palavra;
+                if (ctx.measureText(teste).width <= larguraMaxima) {
+                    linha = teste;
+                } else {
+                    if (linha) linhas.push(linha);
+                    linha = palavra;
+                    if (linhas.length === maximoLinhas - 1) break;
+                }
+            }
+            if (linha && linhas.length < maximoLinhas) linhas.push(linha);
+            const consumido = linhas.join(' ').length;
+            if (consumido < texto.length && linhas.length) {
+                let ultima = linhas.length - 1;
+                while (ctx.measureText(`${linhas[ultima]}…`).width > larguraMaxima) linhas[ultima] = linhas[ultima].slice(0, -1);
+                linhas[ultima] += '…';
+            }
+            return linhas;
+        }
+
+        function exportarGradeComoPng() {
+            const largura = 2400;
+            const margem = 60;
+            const topoGrade = 220;
+            const espaco = 24;
+            const colunas = 4;
+            const larguraPeriodo = (largura - margem * 2 - espaco * (colunas - 1)) / colunas;
+            const alturaPeriodo = 700;
+            const altura = topoGrade + alturaPeriodo * 2 + espaco + margem;
+            const canvas = document.createElement('canvas');
+            canvas.width = largura;
+            canvas.height = altura;
+            const ctx = canvas.getContext('2d');
+
+            const gradiente = ctx.createLinearGradient(0, 0, largura, altura);
+            gradiente.addColorStop(0, '#f8fafc');
+            gradiente.addColorStop(1, '#e2e8f0');
+            ctx.fillStyle = gradiente;
+            ctx.fillRect(0, 0, largura, altura);
+
+            ctx.fillStyle = '#0f172a';
+            ctx.font = 'bold 48px Arial, sans-serif';
+            ctx.fillText('Grade Inteligente · Engenharia de Software', margem, 78);
+            ctx.fillStyle = '#64748b';
+            ctx.font = '24px Arial, sans-serif';
+            ctx.fillText('PUC Minas', margem, 116);
+
+            const concluidas = Object.values(statusMaterias).filter(s => s === 'concluida').length;
+            const cursando = Object.values(statusMaterias).filter(s => s === 'cursando').length;
+            const horas = Object.entries(statusMaterias).reduce((total, [nome, status]) =>
+                total + (status === 'concluida' && disciplinas[nome] ? disciplinas[nome].ch : 0), 0);
+            ctx.font = 'bold 22px Arial, sans-serif';
+            ctx.fillStyle = '#047857';
+            ctx.fillText(`${concluidas} concluídas`, margem, 168);
+            ctx.fillStyle = '#2563eb';
+            ctx.fillText(`${cursando} cursando`, margem + 210, 168);
+            ctx.fillStyle = '#6d28d9';
+            ctx.fillText(`${horas}h concluídas`, margem + 400, 168);
+
+            const temas = {
+                concluida: { fundo: '#ecfdf5', borda: '#10b981', texto: '#065f46', rotulo: 'Concluída' },
+                cursando: { fundo: '#eff6ff', borda: '#3b82f6', texto: '#1e40af', rotulo: 'Cursando' },
+                pendente: { fundo: '#f8fafc', borda: '#cbd5e1', texto: '#475569', rotulo: 'Pendente' }
+            };
+
+            for (let periodo = 1; periodo <= 8; periodo++) {
+                const coluna = (periodo - 1) % colunas;
+                const linha = Math.floor((periodo - 1) / colunas);
+                const x = margem + coluna * (larguraPeriodo + espaco);
+                const y = topoGrade + linha * (alturaPeriodo + espaco);
+
+                ctx.fillStyle = '#ffffff';
+                ctx.strokeStyle = '#cbd5e1';
+                ctx.lineWidth = 2;
+                desenharRetanguloArredondado(ctx, x, y, larguraPeriodo, alturaPeriodo, 22);
+                ctx.fillStyle = '#1e293b';
+                ctx.lineWidth = 0;
+                desenharRetanguloArredondado(ctx, x, y, larguraPeriodo, 66, 22);
+                ctx.fillRect(x, y + 40, larguraPeriodo, 26);
+                ctx.fillStyle = '#ffffff';
+                ctx.font = 'bold 26px Arial, sans-serif';
+                ctx.fillText(`${periodo}º Período`, x + 24, y + 43);
+
+                const materias = Object.entries(disciplinas).filter(([, info]) => info.periodo === periodo);
+                materias.forEach(([nome, info], indice) => {
+                    const status = statusMaterias[nome] || 'pendente';
+                    const tema = temas[status];
+                    const cardX = x + 18;
+                    const cardY = y + 82 + indice * 66;
+                    const cardLargura = larguraPeriodo - 36;
+                    ctx.fillStyle = tema.fundo;
+                    ctx.strokeStyle = tema.borda;
+                    ctx.lineWidth = 2;
+                    desenharRetanguloArredondado(ctx, cardX, cardY, cardLargura, 54, 10);
+                    ctx.fillStyle = tema.borda;
+                    ctx.fillRect(cardX, cardY + 8, 5, 38);
+
+                    ctx.fillStyle = tema.texto;
+                    ctx.font = 'bold 15px Arial, sans-serif';
+                    const linhasNome = quebrarTexto(ctx, nome, cardLargura - 150, 2);
+                    linhasNome.forEach((texto, i) => ctx.fillText(texto, cardX + 18, cardY + 22 + i * 18));
+                    ctx.textAlign = 'right';
+                    ctx.font = 'bold 14px Arial, sans-serif';
+                    ctx.fillText(`${tema.rotulo} · ${info.ch}h`, cardX + cardLargura - 14, cardY + 32);
+                    ctx.textAlign = 'left';
+                });
+            }
+
+            ctx.fillStyle = '#64748b';
+            ctx.font = '18px Arial, sans-serif';
+            ctx.textAlign = 'right';
+            ctx.fillText(`Exportada em ${new Date().toLocaleDateString('pt-BR')}`, largura - margem, altura - 22);
+
+            canvas.toBlob(blob => {
+                if (!blob) return informarImportacao('Não foi possível gerar a imagem.', 'erro');
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `grade-engenharia-software-${new Date().toISOString().slice(0, 10)}.png`;
+                link.click();
+                URL.revokeObjectURL(url);
+                informarImportacao('PNG exportado com sucesso.', 'sucesso');
+            }, 'image/png');
+        }
 
         function getDragAfterElement(container, y) {
             const draggableElements = [...container.querySelectorAll('.disciplina:not(.dragging)')];
@@ -418,12 +697,12 @@
             const cards = [...lista.querySelectorAll('.disciplina')];
             const novaOrdem = cards.map(card => card.dataset.nome);
             ordemMaterias[periodo] = novaOrdem;
-            localStorage.setItem('pucEngSoftOrdem', JSON.stringify(ordemMaterias));
+            persistirEstado();
         }
 
         function salvarProgresso() {
             validarECorrigirGrade();
-            localStorage.setItem('pucEngSoftStatus', JSON.stringify(statusMaterias));
+            persistirEstado();
             renderizarGrade();
         }
 
@@ -447,9 +726,6 @@
                 const correqsOk = !info.correqs || info.correqs.every(req => statusMaterias[req] === 'cursando' || statusMaterias[req] === 'concluida');
 
                 if (status === 'cursando' && (!prereqsOk || !horasOk || !correqsOk)) {
-                    delete statusMaterias[nome];
-                    mudou = true;
-                } else if (status === 'concluida' && (!prereqsOk || !horasOk || !correqsOk)) {
                     delete statusMaterias[nome];
                     mudou = true;
                 }
@@ -488,6 +764,7 @@
                 statusMaterias = {};
                 ordemMaterias = {};
                 localStorage.removeItem('pucEngSoftOrdem');
+                localStorage.removeItem(STORAGE_KEY);
                 salvarProgresso();
             }
         }
@@ -717,6 +994,7 @@
 
         window.onload = function () {
             validarECorrigirGrade();
+            persistirEstado();
             renderizarGrade();
         };
     </script>
