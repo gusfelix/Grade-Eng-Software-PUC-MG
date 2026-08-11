@@ -477,7 +477,8 @@
         }
 
         function localizarMarcador(texto, marcador, aPartirDe = 0) {
-            const padrao = marcador.split(' ').join('\\s*');
+            // Alguns geradores de PDF separam até letras da mesma palavra em itens distintos.
+            const padrao = marcador.replace(/\s/g, '').split('').join('\\s*');
             const correspondencia = new RegExp(padrao).exec(texto.slice(aPartirDe));
             return correspondencia ? aPartirDe + correspondencia.index : -1;
         }
@@ -505,12 +506,11 @@
 
         function interpretarMatriz(textoOriginal) {
             const texto = normalizarTexto(textoOriginal);
-            if (localizarMarcador(texto, 'SISTEMA DE GESTAO ACADEMICA') < 0 || localizarMarcador(texto, 'DEFINICAO DE CURRICULO') < 0) {
-                throw new Error('O arquivo não parece ser a matriz curricular exportada pelo SGA.');
-            }
             const cursadas = intervalo(texto, 'DISCIPLINAS DO CURRICULO', 'DISCIPLINAS EQUIVALENTES');
             const emCurso = intervalo(texto, 'DISCIPLINAS EM CURSO', 'DISCIPLINAS A CURSAR');
-            if (!cursadas || !emCurso) throw new Error('Não foi possível localizar as seções de disciplinas no PDF.');
+            if (!cursadas && !emCurso) {
+                throw new Error('Não foi possível localizar as seções de disciplinas cursadas ou em curso no PDF.');
+            }
 
             const resultado = {};
             const codigosCursadas = new Set(cursadas.match(/\b\d{5}\b/g) || []);
